@@ -11,6 +11,7 @@ class OnlineExam extends Model
     protected $fillable = [
         'class_id',
         'title',
+        'type',
         'description',
         'is_published',
         'available_from',

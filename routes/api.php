@@ -128,6 +128,7 @@ Route::middleware(['auth:sanctum', 'role:admin'])->group(function (): void {
 
     Route::get('online-exams/{onlineExam}/attempts', [\App\Http\Controllers\Api\OnlineExamController::class, 'attempts']);
     Route::get('online-exams/{onlineExam}/analytics', [\App\Http\Controllers\Api\OnlineExamController::class, 'analytics']);
+    Route::post('online-exams/{onlineExam}/upload-questions', [\App\Http\Controllers\Api\OnlineExamController::class, 'uploadQuestions']);
     Route::post('online-exams/{onlineExam}/questions', [\App\Http\Controllers\Api\OnlineExamController::class, 'storeQuestion']);
     Route::put('online-exam-questions/{online_exam_question}', [\App\Http\Controllers\Api\OnlineExamController::class, 'updateQuestion']);
     Route::delete('online-exam-questions/{online_exam_question}', [\App\Http\Controllers\Api\OnlineExamController::class, 'destroyQuestion']);

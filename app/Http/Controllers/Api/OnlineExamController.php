@@ -48,6 +48,7 @@ class OnlineExamController extends Controller
         $data = $request->validate([
             'class_id' => ['required', 'exists:classes,id'],
             'title' => ['required', 'string', 'max:255'],
+            'type' => ['required', 'string', 'in:mcq,single_word,long_word'],
             'description' => ['nullable', 'string', 'max:5000'],
             'is_published' => ['sometimes', 'boolean'],
             'available_from' => ['nullable', 'date'],
@@ -76,6 +77,7 @@ class OnlineExamController extends Controller
         $data = $request->validate([
             'class_id' => ['sometimes', 'required', 'exists:classes,id'],
             'title' => ['sometimes', 'required', 'string', 'max:255'],
+            'type' => ['sometimes', 'required', 'string', 'in:mcq,single_word,long_word'],
             'description' => ['nullable', 'string', 'max:5000'],
             'is_published' => ['sometimes', 'boolean'],
             'available_from' => ['nullable', 'date'],
@@ -108,11 +110,148 @@ class OnlineExamController extends Controller
         return ApiResponse::success(['question' => $this->formatQuestionAdmin($q)], 'Question added', 201);
     }
 
+    public function uploadQuestions(Request $request, OnlineExam $onlineExam): JsonResponse
+    {
+        $request->validate([
+            'document' => ['required', 'file', 'max:10240', 'mimes:txt,pdf,doc,docx'],
+        ]);
+
+        $file = $request->file('document');
+        if (!$file) {
+            return ApiResponse::error('File not uploaded properly', 400);
+        }
+
+        $content = '';
+        $ext = strtolower($file->getClientOriginalExtension());
+        
+        try {
+            if ($ext === 'txt') {
+                $content = file_get_contents($file->getRealPath());
+            } elseif ($ext === 'pdf') {
+                $parser = new \Smalot\PdfParser\Parser();
+                $pdf = $parser->parseFile($file->getRealPath());
+                $content = $pdf->getText();
+            } elseif ($ext === 'docx' || $ext === 'doc') {
+                $zip = new \ZipArchive;
+                if ($zip->open($file->getRealPath()) === true) {
+                    $xml = $zip->getFromName('word/document.xml');
+                    if ($xml !== false) {
+                        $xml = str_replace(['</w:p>', '<w:br/>', '<w:br />'], "\n", $xml);
+                        $content = strip_tags($xml);
+                    }
+                    $zip->close();
+                }
+            }
+        } catch (\Exception $e) {
+            return ApiResponse::error('Failed to read the file: ' . $e->getMessage(), 500);
+        }
+
+        if (!$content) {
+            return ApiResponse::error('Could not extract any text from the document.', 400);
+        }
+
+        \Illuminate\Support\Facades\Log::info("=== EXTRACTED EXAM TEXT ===");
+        \Illuminate\Support\Facades\Log::info($content);
+
+        $maxOrder = (int) $onlineExam->questions()->max('sort_order');
+        $added = 0;
+
+        // More robust Regex parsing for TXT/PDF/DOCX files
+        // Pattern: 
+        // 1. Question... OR 1) Question...
+        // A) ... OR அ) ...
+        // B) ... OR ஆ) ...
+        // Correct: A OR விடை: அ
+        $lines = preg_split('/\r?\n/', $content);
+        $question = '';
+        $options = [];
+        $correctIndex = 0;
+        $currentContext = 'none'; // 'question' or 'option'
+
+        $optionRegex = '/^(?:[a-dஅஆஇஈ])[\)\.\,\s]+\s*(.*)$/iu';
+        $correctRegex = '/(?:correct|answer|ans|விடை|சரியான விடை)[\s\:\-\=]*([a-dஅஆஇஈ])/iu';
+
+        foreach ($lines as $line) {
+            $trim = trim($line);
+            if ($trim === '') continue;
+
+            // Detect start of a new question (e.g., "1.", "1. What is")
+            if (preg_match('/^\d+[\.\)\-\s]+(.*)$/u', $trim, $m)) {
+                // Save previous if exists
+                if ($question && count($options) >= 2) {
+                    OnlineExamQuestion::create([
+                        'online_exam_id' => $onlineExam->id,
+                        'sort_order' => ++$maxOrder,
+                        'prompt' => trim($question),
+                        'options' => array_values($options),
+                        'correct_index' => $correctIndex,
+                        'points' => 1,
+                    ]);
+                    $added++;
+                }
+                // Start new
+                $question = $m[1];
+                $options = [];
+                $correctIndex = 0;
+                $currentContext = 'question';
+                continue;
+            }
+            
+            // Detect option lines
+            if (preg_match($optionRegex, $trim, $optMatch)) {
+                $options[] = $optMatch[1];
+                $currentContext = 'option';
+                continue;
+            }
+
+            // Detect correct answer line anywhere
+            if (preg_match($correctRegex, $trim, $corrMatch)) {
+                $letter = mb_strtoupper(trim($corrMatch[1]), 'UTF-8');
+                $map = [
+                    'A' => 0, 'B' => 1, 'C' => 2, 'D' => 3,
+                    'அ' => 0, 'ஆ' => 1, 'இ' => 2, 'ஈ' => 3
+                ];
+                $correctIndex = $map[$letter] ?? 0;
+                $currentContext = 'none';
+                continue;
+            }
+
+            // If it's just extra text
+            if ($currentContext === 'question') {
+                $question .= " " . $trim;
+            } elseif ($currentContext === 'option' && count($options) > 0) {
+                $options[count($options) - 1] .= " " . $trim;
+            }
+        }
+
+        // Save the last buffered question
+        if ($question && count($options) >= 2) {
+            OnlineExamQuestion::create([
+                'online_exam_id' => $onlineExam->id,
+                'sort_order' => ++$maxOrder,
+                'prompt' => trim($question),
+                'options' => array_values($options),
+                'correct_index' => $correctIndex,
+                'points' => 1,
+            ]);
+            $added++;
+        }
+
+        if ($added === 0) {
+            return ApiResponse::error('Could not find any properly formatted questions in the document. Please use a structured format like "1. Question... A) Option 1 B) Option 2 Answer: A".', 400);
+        }
+
+        return ApiResponse::success([
+            'added_count' => $added,
+            'exam' => $this->formatExamAdmin($onlineExam->fresh()->load(['schoolClass', 'questions'])),
+        ], "$added questions extracted and added successfully!");
+    }
+
     public function updateQuestion(Request $request, OnlineExamQuestion $onlineExamQuestion): JsonResponse
     {
         $data = $request->validate([
             'prompt' => ['sometimes', 'string', 'max:5000'],
-            'options' => ['sometimes', 'array', 'min:2', 'max:12'],
+            'options' => ['sometimes', 'array', 'min:1', 'max:12'],
             'options.*' => ['required_with:options', 'string', 'max:500'],
             'correct_index' => ['sometimes', 'integer', 'min:0'],
             'points' => ['sometimes', 'numeric', 'min:0.25', 'max:1000'],
@@ -274,26 +413,33 @@ class OnlineExamController extends Controller
             'options' => $q->options,
         ])->values()->all();
 
-        $attempt = OnlineExamAttempt::query()
-            ->where('online_exam_id', $onlineExam->id)
-            ->where('student_id', $student->id)
-            ->first();
+        $attempt = OnlineExamAttempt::query()->firstOrCreate(
+            [
+                'online_exam_id' => $onlineExam->id,
+                'student_id' => $student->id,
+            ],
+            [
+                'started_at' => now(),
+            ]
+        );
 
         return ApiResponse::success([
             'exam' => [
                 'id' => $onlineExam->id,
                 'title' => $onlineExam->title,
+                'type' => $onlineExam->type,
                 'description' => $onlineExam->description,
                 'duration_minutes' => $onlineExam->duration_minutes,
                 'available_from' => $onlineExam->available_from?->toIso8601String(),
                 'available_until' => $onlineExam->available_until?->toIso8601String(),
             ],
             'questions' => $questions,
-            'attempt' => $attempt ? [
+            'attempt' => [
+                'started_at' => $attempt->started_at?->toIso8601String(),
                 'submitted_at' => $attempt->submitted_at?->toIso8601String(),
                 'score' => $attempt->score !== null ? (string) $attempt->score : null,
                 'max_score' => $attempt->max_score !== null ? (string) $attempt->max_score : null,
-            ] : null,
+            ],
         ]);
     }
 
@@ -319,19 +465,16 @@ class OnlineExamController extends Controller
 
         $data = $request->validate([
             'answers' => ['required', 'array'],
-            'answers.*' => ['integer', 'min:0', 'max:25'],
         ]);
 
         $answers = [];
-        foreach ($data['answers'] as $key => $idx) {
-            $answers[(string) $key] = (int) $idx;
+        foreach ($data['answers'] as $key => $val) {
+            $answers[(string) $key] = $val;
         }
 
         foreach ($questions->keys() as $qid) {
-            if (! array_key_exists((string) $qid, $answers)) {
-                return ApiResponse::error('Answer every question.', 422, [
-                    'answers' => ['Missing answer for question '.$qid],
-                ]);
+            if (! array_key_exists((string) $qid, $answers) || $answers[(string) $qid] === null || $answers[(string) $qid] === '') {
+                $answers[(string) $qid] = null;
             }
         }
 
@@ -345,12 +488,25 @@ class OnlineExamController extends Controller
         $score = 0.0;
         foreach ($questions as $q) {
             $chosen = $answers[(string) $q->id];
-            $opts = $q->options ?? [];
-            if ($chosen < 0 || $chosen >= count($opts)) {
-                return ApiResponse::error('Invalid option index for a question.', 422);
+            if ($chosen === null || $chosen === '') {
+                continue;
             }
-            if ($chosen === (int) $q->correct_index) {
-                $score += (float) $q->points;
+            if ($onlineExam->type === 'mcq') {
+                $chosenIdx = (int) $chosen;
+                $opts = $q->options ?? [];
+                if ($chosenIdx < 0 || $chosenIdx >= count($opts)) {
+                    return ApiResponse::error('Invalid option index for a question.', 422);
+                }
+                if ($chosenIdx === (int) $q->correct_index) {
+                    $score += (float) $q->points;
+                }
+            } elseif ($onlineExam->type === 'single_word') {
+                $correctAnswer = $q->options[0] ?? '';
+                if (strcasecmp(trim((string) $chosen), trim($correctAnswer)) === 0) {
+                    $score += (float) $q->points;
+                }
+            } else {
+                // Long word/essay answers are saved but not auto-graded (earned points = 0 for now)
             }
         }
         $score = round($score, 2);
@@ -408,13 +564,24 @@ class OnlineExamController extends Controller
         $lines = [];
         foreach ($questions as $q) {
             $chosen = $responses[(string) $q->id] ?? null;
-            $ok = $chosen !== null && (int) $chosen === (int) $q->correct_index;
+            
+            if ($onlineExam->type === 'mcq') {
+                $ok = $chosen !== null && (int) $chosen === (int) $q->correct_index;
+            } elseif ($onlineExam->type === 'single_word') {
+                $correctAnswer = $q->options[0] ?? '';
+                $ok = $chosen !== null && strcasecmp(trim((string) $chosen), trim($correctAnswer)) === 0;
+            } else {
+                $ok = false;
+            }
+
             $lines[] = [
                 'question_id' => $q->id,
                 'prompt' => $q->prompt,
                 'options' => $q->options,
-                'chosen_index' => $chosen,
-                'correct_index' => (int) $q->correct_index,
+                'chosen_index' => $onlineExam->type === 'mcq' ? ($chosen !== null ? (int) $chosen : null) : null,
+                'chosen_text' => $onlineExam->type === 'mcq' ? null : ($chosen !== null ? (string) $chosen : null),
+                'correct_index' => $onlineExam->type === 'mcq' ? (int) $q->correct_index : null,
+                'correct_text' => $onlineExam->type === 'mcq' ? null : ($q->options[0] ?? ''),
                 'is_correct' => $ok,
                 'points' => (string) $q->points,
                 'earned' => $ok ? (string) $q->points : '0',
@@ -425,6 +592,7 @@ class OnlineExamController extends Controller
             'exam' => [
                 'id' => $onlineExam->id,
                 'title' => $onlineExam->title,
+                'type' => $onlineExam->type,
             ],
             'attempt' => [
                 'score' => $attempt->score !== null ? (string) $attempt->score : null,
@@ -480,7 +648,7 @@ class OnlineExamController extends Controller
     {
         $data = $request->validate([
             'prompt' => ['required', 'string', 'max:5000'],
-            'options' => ['required', 'array', 'min:2', 'max:12'],
+            'options' => ['required', 'array', 'min:1', 'max:12'],
             'options.*' => ['required', 'string', 'max:500'],
             'correct_index' => ['required', 'integer', 'min:0'],
             'points' => ['sometimes', 'numeric', 'min:0.25', 'max:1000'],
@@ -501,6 +669,7 @@ class OnlineExamController extends Controller
             'id' => $e->id,
             'class_id' => $e->class_id,
             'title' => $e->title,
+            'type' => $e->type,
             'is_published' => $e->is_published,
             'questions_count' => $e->questions_count ?? $e->questions()->count(),
             'attempts_count' => $e->attempts_count ?? 0,
@@ -522,6 +691,7 @@ class OnlineExamController extends Controller
             'id' => $e->id,
             'class_id' => $e->class_id,
             'title' => $e->title,
+            'type' => $e->type,
             'description' => $e->description,
             'is_published' => $e->is_published,
             'available_from' => $e->available_from?->toIso8601String(),
