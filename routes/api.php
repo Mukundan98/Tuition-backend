@@ -38,6 +38,8 @@ Route::middleware(['auth:sanctum', 'role:admin,teacher'])->group(function (): vo
 Route::middleware(['auth:sanctum', 'role:teacher'])->group(function (): void {
     Route::post('exam-papers', [\App\Http\Controllers\Api\ExamPaperController::class, 'store']);
     Route::get('my-teaching-subjects', [\App\Http\Controllers\Api\SubjectController::class, 'forCurrentTeacher']);
+    Route::get('leaves', [\App\Http\Controllers\Api\LeaveRequestController::class, 'index']);
+    Route::post('leaves', [\App\Http\Controllers\Api\LeaveRequestController::class, 'store']);
 });
 
 Route::middleware(['auth:sanctum', 'role:student'])->get('dashboard/student', [DashboardController::class, 'student']);
@@ -138,4 +140,7 @@ Route::middleware(['auth:sanctum', 'role:admin'])->group(function (): void {
     Route::apiResource('teachers', \App\Http\Controllers\Api\TeacherController::class);
     Route::apiResource('classes', \App\Http\Controllers\Api\SchoolClassController::class);
     Route::apiResource('subjects', \App\Http\Controllers\Api\SubjectController::class);
+    
+    Route::get('leaves', [\App\Http\Controllers\Api\LeaveRequestController::class, 'adminIndex']);
+    Route::patch('leaves/{leave}/status', [\App\Http\Controllers\Api\LeaveRequestController::class, 'updateStatus']);
 });

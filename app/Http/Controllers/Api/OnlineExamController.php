@@ -128,7 +128,9 @@ class OnlineExamController extends Controller
             if ($ext === 'txt') {
                 $content = file_get_contents($file->getRealPath());
             } elseif ($ext === 'pdf') {
-                $parser = new \Smalot\PdfParser\Parser();
+                $config = new \Smalot\PdfParser\Config();
+                $config->setFontSpaceLimit(-15); // Adjust font space limit to keep word boundaries separate
+                $parser = new \Smalot\PdfParser\Parser([], $config);
                 $pdf = $parser->parseFile($file->getRealPath());
                 $content = $pdf->getText();
             } elseif ($ext === 'docx' || $ext === 'doc') {
@@ -156,86 +158,195 @@ class OnlineExamController extends Controller
         $maxOrder = (int) $onlineExam->questions()->max('sort_order');
         $added = 0;
 
-        // More robust Regex parsing for TXT/PDF/DOCX files
-        // Pattern: 
-        // 1. Question... OR 1) Question...
-        // A) ... OR அ) ...
-        // B) ... OR ஆ) ...
-        // Correct: A OR விடை: அ
         $lines = preg_split('/\r?\n/', $content);
         $question = '';
         $options = [];
         $correctIndex = 0;
+        $foundAnswer = false;
         $currentContext = 'none'; // 'question' or 'option'
 
-        $optionRegex = '/^(?:[a-dஅஆஇஈ])[\)\.\,\s]+\s*(.*)$/iu';
-        $correctRegex = '/(?:correct|answer|ans|விடை|சரியான விடை)[\s\:\-\=]*([a-dஅஆஇஈ])/iu';
+        // --- Letter-to-index mapping (English + Tamil) ---
+        $letterMap = [
+            'A' => 0, 'B' => 1, 'C' => 2, 'D' => 3,
+            'a' => 0, 'b' => 1, 'c' => 2, 'd' => 3,
+            'அ' => 0, 'ஆ' => 1, 'இ' => 2, 'ஈ' => 3,
+        ];
+
+        // --- Regex: option line (A) / a. / A. / A, / (A) etc.) ---
+        $optionLetterRegex = '/(?:^|\s+)(?:[\(\[]?\s*([a-dஅஆஇஈA-D])\s*[\)\.\,\]\:]+)/iu';
+
+        // --- Regex: standalone correct-answer line ---
+        // Matches many common formats:
+        //   "Answer: B", "Ans: C", "Ans. D", "Correct Answer: A", "Correct: B",
+        //   "Key: C", "Answer - B", "Answer = A", "Ans:B", "answer:a",
+        //   "விடை: அ", "சரியான விடை: ஆ", "(Answer: B)", "Answer : B"
+        $correctLineRegex = '/(?:correct\s*answer|answer|ans|key|விடை|சரியான\s*விடை)\s*[\:\.\-\=\s]\s*[\(\[]?\s*([a-dஅஆஇஈ])\s*[\)\]]?\s*$/iu';
+
+        // --- Regex: answer embedded at end of a line (e.g. after last option) ---
+        // "D) Option text   Answer: B" or "D) Option text  (Ans: B)"
+        $inlineAnswerRegex = '/(?:correct\s*answer|answer|ans|key|விடை|சரியான\s*விடை)\s*[\:\.\-\=\s]\s*[\(\[]?\s*([a-dஅஆஇஈ])\s*[\)\]]?\s*$/iu';
+
+        // --- Regex: asterisk/star marking on an option (e.g. "B) Option *" or "* B) Option") ---
+        $asteriskSuffix = '/\s*[\*✓✔⭐★☆]+\s*$/u';
+        $asteriskPrefix = '/^[\*✓✔⭐★☆]+\s*/u';
+
+        // Helper: resolve a letter to an index
+        $resolveLetterIndex = function (string $letter) use ($letterMap): int {
+            $letter = trim($letter);
+            return $letterMap[$letter] ?? $letterMap[mb_strtoupper($letter, 'UTF-8')] ?? 0;
+        };
+
+        // Helper: extract multiple inline options from a single line
+        $extractOptions = function(string $text) use ($optionLetterRegex) {
+            if (!preg_match_all($optionLetterRegex, $text, $matches, PREG_OFFSET_CAPTURE)) {
+                return [];
+            }
+            
+            $results = [];
+            $numMatches = count($matches[0]);
+            
+            for ($i = 0; $i < $numMatches; $i++) {
+                $currentMarker = $matches[0][$i][0];
+                $currentOffset = $matches[0][$i][1];
+                $currentLetter = $matches[1][$i][0];
+                
+                // The text for this option starts after the current marker
+                $startPos = $currentOffset + strlen($currentMarker);
+                
+                // And ends before the next option marker (or end of string)
+                if ($i < $numMatches - 1) {
+                    $nextOffset = $matches[0][$i + 1][1]; // start offset of next marker
+                    $length = $nextOffset - $startPos;
+                    $optionText = substr($text, $startPos, $length);
+                } else {
+                    $optionText = substr($text, $startPos);
+                }
+                
+                $results[] = [
+                    'letter' => $currentLetter,
+                    'text' => trim($optionText)
+                ];
+            }
+            
+            return $results;
+        };
+
+        // Helper: save a buffered question
+        $saveBuffered = function () use (
+            &$question, &$options, &$correctIndex, &$foundAnswer,
+            &$maxOrder, &$added, $onlineExam
+        ) {
+            if ($question && count($options) >= 2) {
+                // Clamp correctIndex within valid range
+                if ($correctIndex < 0 || $correctIndex >= count($options)) {
+                    $correctIndex = 0;
+                }
+                
+                \Illuminate\Support\Facades\Log::info("PARSED Q: \"" . Str::limit(trim($question), 80) . "\" | Options: " . count($options) . " | Correct: " . $correctIndex . " (found=" . ($foundAnswer ? 'yes' : 'no') . ")");
+
+                OnlineExamQuestion::create([
+                    'online_exam_id' => $onlineExam->id,
+                    'sort_order' => ++$maxOrder,
+                    'prompt' => trim($question),
+                    'options' => array_values($options),
+                    'correct_index' => $correctIndex,
+                    'points' => 1,
+                ]);
+                $added++;
+            }
+        };
 
         foreach ($lines as $line) {
             $trim = trim($line);
             if ($trim === '') continue;
 
-            // Detect start of a new question (e.g., "1.", "1. What is")
-            if (preg_match('/^\d+[\.\)\-\s]+(.*)$/u', $trim, $m)) {
-                // Save previous if exists
-                if ($question && count($options) >= 2) {
-                    OnlineExamQuestion::create([
-                        'online_exam_id' => $onlineExam->id,
-                        'sort_order' => ++$maxOrder,
-                        'prompt' => trim($question),
-                        'options' => array_values($options),
-                        'correct_index' => $correctIndex,
-                        'points' => 1,
-                    ]);
-                    $added++;
+            // 1) Detect start of a new question (e.g., "1.", "1)", "1 -", "01.")
+            if (preg_match('/^\d+[\.\)\-\:\s]+\s*(.*)$/u', $trim, $m)) {
+                $candidateText = trim($m[1]);
+                
+                // Check if this line is actually an answer line embedded with question number
+                if (preg_match($correctLineRegex, $candidateText, $corrMatch)) {
+                    $correctIndex = $resolveLetterIndex($corrMatch[1]);
+                    $foundAnswer = true;
+                    $currentContext = 'none';
+                    continue;
                 }
-                // Start new
-                $question = $m[1];
+
+                // Save previous question if one is buffered
+                $saveBuffered();
+
+                // Start new question
+                $question = $candidateText;
                 $options = [];
                 $correctIndex = 0;
+                $foundAnswer = false;
                 $currentContext = 'question';
                 continue;
             }
             
-            // Detect option lines
-            if (preg_match($optionRegex, $trim, $optMatch)) {
-                $options[] = $optMatch[1];
-                $currentContext = 'option';
-                continue;
-            }
-
-            // Detect correct answer line anywhere
-            if (preg_match($correctRegex, $trim, $corrMatch)) {
-                $letter = mb_strtoupper(trim($corrMatch[1]), 'UTF-8');
-                $map = [
-                    'A' => 0, 'B' => 1, 'C' => 2, 'D' => 3,
-                    'அ' => 0, 'ஆ' => 1, 'இ' => 2, 'ஈ' => 3
-                ];
-                $correctIndex = $map[$letter] ?? 0;
+            // 2) Detect standalone correct-answer line BEFORE option detection
+            if (preg_match($correctLineRegex, $trim, $corrMatch)) {
+                $correctIndex = $resolveLetterIndex($corrMatch[1]);
+                $foundAnswer = true;
                 $currentContext = 'none';
                 continue;
             }
 
-            // If it's just extra text
+            // 3) Detect option lines (including multiple options in a single line)
+            $detectedOptions = $extractOptions($trim);
+            if (!empty($detectedOptions)) {
+                foreach ($detectedOptions as $opt) {
+                    $optLetter = $opt['letter'];
+                    $optText = trim($opt['text']);
+                    $markedCorrect = false;
+
+                    // Check for asterisk/checkmark suffix marking correct answer
+                    if (preg_match($asteriskSuffix, $optText)) {
+                        $optText = preg_replace($asteriskSuffix, '', $optText);
+                        $markedCorrect = true;
+                    }
+                    // Check for asterisk/checkmark prefix on the letter
+                    if (preg_match($asteriskPrefix, $optText)) {
+                        $optText = preg_replace($asteriskPrefix, '', $optText);
+                        $markedCorrect = true;
+                    }
+
+                    // Check if the option line has an inline answer at the end
+                    if (preg_match($inlineAnswerRegex, $optText, $inlineMatch)) {
+                        $optText = trim(preg_replace($inlineAnswerRegex, '', $optText));
+                        $correctIndex = $resolveLetterIndex($inlineMatch[1]);
+                        $foundAnswer = true;
+                    }
+
+                    $options[] = trim($optText);
+
+                    if ($markedCorrect) {
+                        $correctIndex = count($options) - 1;
+                        $foundAnswer = true;
+                    }
+                }
+
+                $currentContext = 'option';
+                continue;
+            }
+
+            // 4) If it's just extra text, append to current context
             if ($currentContext === 'question') {
                 $question .= " " . $trim;
             } elseif ($currentContext === 'option' && count($options) > 0) {
-                $options[count($options) - 1] .= " " . $trim;
+                // Check if the continuation line contains an answer marker
+                if (preg_match($correctLineRegex, $trim, $corrMatch)) {
+                    $correctIndex = $resolveLetterIndex($corrMatch[1]);
+                    $foundAnswer = true;
+                    $currentContext = 'none';
+                } else {
+                    $options[count($options) - 1] .= " " . $trim;
+                }
             }
         }
 
         // Save the last buffered question
-        if ($question && count($options) >= 2) {
-            OnlineExamQuestion::create([
-                'online_exam_id' => $onlineExam->id,
-                'sort_order' => ++$maxOrder,
-                'prompt' => trim($question),
-                'options' => array_values($options),
-                'correct_index' => $correctIndex,
-                'points' => 1,
-            ]);
-            $added++;
-        }
+        $saveBuffered();
 
         if ($added === 0) {
             return ApiResponse::error('Could not find any properly formatted questions in the document. Please use a structured format like "1. Question... A) Option 1 B) Option 2 Answer: A".', 400);
